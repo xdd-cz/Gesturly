@@ -76,15 +76,16 @@ class GesturlyUI(QWidget):
         
         # --- VIDEO FEED WIDGET ---
         self.feed_label = QLabel("Loading Camera...")
-        self.feed_label.setFixedSize(259, 146) # 16:9 Aspect ratio fitted to width
+        self.feed_label.setFixedSize(259, 146)
         self.feed_label.setStyleSheet("background-color: #000; border-radius: 10px;")
         self.feed_label.setScaledContents(True)
         intro_layout.addWidget(self.feed_label)
         
-        # Start the Gesture Thread
-        self.thread = GestureWorker()
-        self.thread.change_pixmap_signal.connect(self.update_video_feed)
-        self.thread.start()
+        self.gesture_status = QLabel("State: No Hand")
+        self.gesture_status.setFont(QFont(urbanist, 12))
+        self.gesture_status.setStyleSheet("color: #F7FFE3; margin-top: 10px;")
+        self.gesture_status.setAlignment(Qt.AlignmentFlag.AlignTop)
+        intro_layout.addWidget(self.gesture_status)
         
         # --- Now Playing ---
         playing = QFrame()
@@ -125,6 +126,12 @@ class GesturlyUI(QWidget):
         main_layout.addWidget(intro)
         main_layout.addWidget(playing)
         
+        # --- Start Gesture Thread (ONCE ONLY) ---
+        self.thread = GestureWorker()
+        self.thread.change_pixmap_signal.connect(self.update_video_feed)
+        self.thread.gesture_signal.connect(self.update_gesture_label)
+        self.thread.start()
+        
         # Auto-update timer for music info
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_song_info)
@@ -134,6 +141,10 @@ class GesturlyUI(QWidget):
     def update_video_feed(self, qt_image):
         """Receives image from gesture_worker and updates the label"""
         self.feed_label.setPixmap(QPixmap.fromImage(qt_image))
+
+    def update_gesture_label(self, gesture_text):
+        """Updates the text label with the current gesture"""
+        self.gesture_status.setText(f"State: {gesture_text}")
 
     def closeEvent(self, event):
         """Clean up thread when closing window"""
@@ -187,9 +198,7 @@ class GesturlyUI(QWidget):
     
     def get_album_art_from_music(self):
         temp_file = os.path.join(tempfile.gettempdir(), "gesturly_album_art.jpg")
-        if os.path.exists(temp_file):
-            try: os.remove(temp_file)
-            except: pass
+        # Optimization: Don't aggressively remove file if we are just going to overwrite it
         
         script = f'''
         if application "Music" is running then

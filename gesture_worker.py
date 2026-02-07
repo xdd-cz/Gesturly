@@ -3,18 +3,22 @@ import mediapipe as mp
 import math
 import time
 from pynput.keyboard import Key, Controller
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
 class GestureWorker(QThread):
-    # Signal to send the video frame to the GUI
     change_pixmap_signal = pyqtSignal(QImage)
+    gesture_signal = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
         self._is_running = True
         self.keyboard = Controller()
-
+        
+        # Cooldown management
+        self.last_action_time = 0
+        self.cooldown_duration = 0.5 # Default cooldown
+    
     def calculate_distance(self, p1, p2):
         return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
 
@@ -29,7 +33,7 @@ class GestureWorker(QThread):
         thumb_mcp = landmarks[2]
         return thumb_tip.y < thumb_mcp.y - 0.05
 
-    def detect_gesture(self, landmarks, handedness):
+    def detect_gesture(self, landmarks):
         # Finger statuses
         index_up = self.is_finger_extended(landmarks, 8, 6, 5)
         middle_up = self.is_finger_extended(landmarks, 12, 10, 9)
@@ -43,27 +47,68 @@ class GestureWorker(QThread):
 
         # Logic
         if index_up and middle_up and ring_up and pinky_up and thumb_up_state:
-            return "open palm", (0, 255, 0)
+            return "Open Palm", (0, 255, 0) # Green
         
         if not index_up and not middle_up and not ring_up and not pinky_up and not thumb_up_state:
-            return "thumbs down", (0, 0, 255)
+            return "Thumbs Down", (255, 0, 0) # Red
         
         if thumb_up_state and not index_up and not middle_up and not ring_up and not pinky_up:
-            return "thumbs up", (255, 255, 0)
+            return "Thumbs Up", (255, 255, 0) # Yellow
         
         if thumb_index_dist < 0.05 and middle_up and ring_up and pinky_up:
-            return "ok", (255, 0, 255)
+            return "OK", (255, 0, 255) # Magenta
         
         if index_up and middle_up and not ring_up and not pinky_up and not thumb_up_state:
-            return "peace", (255, 128, 0)
+            return "Peace", (255, 128, 0) # Orange
         
         return "Unknown", (128, 128, 128)
 
+    def execute_action(self, gesture):
+        """Executes keyboard action with non-blocking cooldown"""
+        current_time = time.time()
+        
+        # Define cooldowns per gesture (seconds)
+        cooldowns = {
+            "Thumbs Up": 0.3,
+            "Thumbs Down": 0.3,
+            "OK": 1.5,     # Longer cooldown for Play/Pause to prevent toggle spam
+            "Peace": 1.5   # Longer cooldown for Skip
+        }
+
+        if gesture not in cooldowns:
+            return
+
+        required_wait = cooldowns.get(gesture, 0.5)
+
+        if (current_time - self.last_action_time) > required_wait:
+            if gesture == "Thumbs Up":
+                self.keyboard.press(Key.media_volume_up)
+                self.keyboard.release(Key.media_volume_up)
+            elif gesture == "Thumbs Down":
+                self.keyboard.press(Key.media_volume_down)
+                self.keyboard.release(Key.media_volume_down)
+            elif gesture == "OK":
+                self.keyboard.press(Key.media_play_pause)
+                self.keyboard.release(Key.media_play_pause)
+            elif gesture == "Peace":
+                self.keyboard.press(Key.media_next)
+                self.keyboard.release(Key.media_next)
+            
+            self.last_action_time = current_time
+
     def run(self):
-        # Setup MediaPipe
         mp_hands = mp.solutions.hands
         mp_draw = mp.solutions.drawing_utils
-        hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+        
+        # Optimization: Define DrawingSpecs once, not every frame
+        joint_spec = mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=3)
+        conn_spec = mp_draw.DrawingSpec(color=(255, 0, 0), thickness=2)
+        
+        hands = mp_hands.Hands(
+            max_num_hands=1, 
+            min_detection_confidence=0.7, 
+            min_tracking_confidence=0.7
+        )
         
         cap = cv2.VideoCapture(0)
         
@@ -72,56 +117,45 @@ class GestureWorker(QThread):
             if not success:
                 continue
 
+            # 1. Flip
             img = cv2.flip(img, 1)
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            result = hands.process(rgb)
+            
+            # 2. Convert to RGB ONCE for both MediaPipe and PyQt
+            # Note: OpenCV uses BGR, MediaPipe/Qt use RGB.
+            # We will work entirely in RGB after this point.
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            result = hands.process(img_rgb)
             
             gesture_text = ""
             color = (255, 255, 255)
 
             if result.multi_hand_landmarks:
-                for hand_lms, hand_info in zip(result.multi_hand_landmarks, result.multi_handedness):
-                    mp_draw.draw_landmarks(img, hand_lms, mp_hands.HAND_CONNECTIONS, mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=3), mp_draw.DrawingSpec(color=(255, 0, 0), thickness=2))
-                    handedness = hand_info.classification[0].label
-                    gesture_text, color = self.detect_gesture(hand_lms.landmark, handedness)
+                for hand_lms in result.multi_hand_landmarks:
+                    # Draw directly on the RGB image
+                    mp_draw.draw_landmarks(img_rgb, hand_lms, mp_hands.HAND_CONNECTIONS, joint_spec, conn_spec)
+                    
+                    gesture_text, color = self.detect_gesture(hand_lms.landmark)
+                    
+                    # Execute Action (Non-blocking)
+                    self.execute_action(gesture_text)
 
-            # --- Control Logic ---
-            if gesture_text == "thumbs up":
-                self.keyboard.press(Key.media_volume_up)
-                self.keyboard.release(Key.media_volume_up)
-                time.sleep(0.2) # Reduced sleep for smoother UI
-            elif gesture_text == "thumbs down":
-                self.keyboard.press(Key.media_volume_down)
-                self.keyboard.release(Key.media_volume_down)
-                time.sleep(0.2)
-            elif gesture_text == "ok":
-                self.keyboard.press(Key.media_play_pause)
-                self.keyboard.release(Key.media_play_pause)
-                time.sleep(1)
-            elif gesture_text == "peace":
-                self.keyboard.press(Key.media_next)
-                self.keyboard.release(Key.media_next)
-                time.sleep(1)
+            # Signal Gesture Text
+            self.gesture_signal.emit(gesture_text if gesture_text else "No Hand")
 
-            # --- UI Preparation ---
-            # Add text to image before sending to GUI
+            # Draw Text on Image (Use RGB colors)
             if gesture_text:
-                cv2.putText(img, gesture_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                cv2.putText(img_rgb, gesture_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
-            # Convert to QImage for PyQt
-            h, w, ch = img.shape
+            # 3. Create QImage directly from the modified RGB image
+            h, w, ch = img_rgb.shape
             bytes_per_line = ch * w
+            convert_to_qt_format = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             
-            final_display_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            # The image must be RGB for PyQt
-            convert_to_qt_format = QImage(final_display_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            
-            # Emit the signal
             self.change_pixmap_signal.emit(convert_to_qt_format)
             
-            # Small sleep to save CPU
-            time.sleep(0.01)
+            # Tiny sleep to yield execution to GUI thread
+            self.msleep(10) 
 
         cap.release()
 
